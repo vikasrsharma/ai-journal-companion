@@ -1,0 +1,16 @@
+# macOS cruft
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv*/
+venv/
+env/
+
+# Local data/secrets
+.env
+journal.db
+journal.csv
