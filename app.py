@@ -2,6 +2,7 @@ import os
 import sqlite3
 from datetime import datetime
 from typing import Optional
+import hashlib
 
 import pandas as pd
 import requests
@@ -32,44 +33,114 @@ if audio_input_fn is None:
     audio_input_fn = getattr(st, "experimental_audio_input", None)
 
 # ------------------------
-# Utilities: DB
+# DB helpers
 # ------------------------
-def get_conn():
+def init_db():
+    """Create tables if they don't exist."""
     conn = sqlite3.connect(DB_PATH)
-    conn.execute(
+    cur = conn.cursor()
+
+    # Users table
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL
+        )
+        """
+    )
+
+    # Entries table (per user)
+    cur.execute(
         """
         CREATE TABLE IF NOT EXISTS entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
             ts TEXT NOT NULL,
             mood INTEGER,
             tags TEXT,
             entry TEXT NOT NULL,
             response_mode TEXT NOT NULL,
-            response TEXT NOT NULL
+            response TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
         )
         """
     )
-    return conn
+
+    conn.commit()
+    conn.close()
 
 
-def save_entry(ts: str, mood: Optional[int], tags: str, entry: str, response_mode: str, response: str):
+def get_conn():
+    return sqlite3.connect(DB_PATH)
+
+
+def save_entry(user_id: int, ts: str, mood: Optional[int], tags: str,
+               entry: str, response_mode: str, response: str):
     conn = get_conn()
     conn.execute(
-        "INSERT INTO entries (ts, mood, tags, entry, response_mode, response) VALUES (?, ?, ?, ?, ?, ?)",
-        (ts, mood, tags, entry, response_mode, response),
+        """
+        INSERT INTO entries (user_id, ts, mood, tags, entry, response_mode, response)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (user_id, ts, mood, tags, entry, response_mode, response),
     )
     conn.commit()
     conn.close()
 
 
-def load_entries() -> pd.DataFrame:
+def load_entries(user_id: int) -> pd.DataFrame:
     conn = get_conn()
-    df = pd.read_sql_query("SELECT * FROM entries ORDER BY ts DESC", conn)
+    df = pd.read_sql_query(
+        "SELECT * FROM entries WHERE user_id = ? ORDER BY ts DESC",
+        conn,
+        params=(user_id,),
+    )
     conn.close()
     return df
 
 # ------------------------
-# Utilities: LLM (text)
+# User auth helpers
+# ------------------------
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def create_user(username: str, password: str) -> tuple[bool, str]:
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            (username, hash_password(password)),
+        )
+        conn.commit()
+        return True, "Account created. You can log in now."
+    except sqlite3.IntegrityError:
+        return False, "Username already taken."
+    finally:
+        conn.close()
+
+
+def authenticate_user(username: str, password: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, password_hash FROM users WHERE username = ?",
+        (username,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    user_id, stored_hash = row
+    if stored_hash == hash_password(password):
+        return {"id": user_id, "username": username}
+    return None
+
+# ------------------------
+# LLM helpers
 # ------------------------
 SYSTEM_PROMPT = (
     "You are an empathetic, supportive journaling companion. You are NOT a clinician. "
@@ -109,7 +180,7 @@ def call_openai(user_text: str, mode: str) -> str:
         return f"❌ API error: {e}"
 
 # ------------------------
-# Utilities: Audio (STT & TTS)
+# Audio helpers (STT & TTS)
 # ------------------------
 def transcribe_audio(audio_bytes: bytes, filename: str = "audio.webm") -> str:
     """Send microphone recording to Whisper for transcription."""
@@ -165,19 +236,62 @@ def synthesize_speech(text: str, voice: str = "alloy", format_ext: str = "mp3") 
         return b""
 
 # ------------------------
-# UI
+# App UI
 # ------------------------
+init_db()  # ensure tables exist
 
-# Safety banner
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+# Safety banner (always visible)
 st.info(
     "**Safety note:** This app is for reflection, not medical care. "
     "If you’re in crisis, call local emergency services or a crisis hotline (e.g., 988 in the U.S.).",
     icon="🛟",
 )
 
+# Login / signup gate
 st.title("💬 AI Journal Companion")
-st.caption("A gentle, privacy-first space to reflect, reframe, and plan.")
 
+if st.session_state.user is None:
+    st.subheader("Login or Sign Up")
+
+    tab_login, tab_signup = st.tabs(["Login", "Sign Up"])
+
+    with tab_login:
+        login_username = st.text_input("Username", key="login_username")
+        login_password = st.text_input("Password", type="password", key="login_password")
+        if st.button("Log in"):
+            user = authenticate_user(login_username, login_password)
+            if user:
+                st.session_state.user = user
+                st.success(f"Welcome back, {user['username']}!")
+                st.rerun()
+            else:
+                st.error("Invalid username or password.")
+
+    with tab_signup:
+        signup_username = st.text_input("New username", key="signup_username")
+        signup_password = st.text_input("New password", type="password", key="signup_password")
+        if st.button("Create account"):
+            ok, msg = create_user(signup_username, signup_password)
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+
+    st.stop()  # Don't show journal UI until logged in
+
+# If we reach here, user is logged in
+user = st.session_state.user
+user_id = user["id"]
+
+st.caption(f"Logged in as **{user['username']}**")
+if st.button("Log out"):
+    st.session_state.user = None
+    st.rerun()
+
+# Sidebar settings
 with st.sidebar:
     st.header("Settings")
     mode = st.radio("Response mode", ["Reflect", "Reframe", "Action Plan"], index=0)
@@ -189,7 +303,7 @@ with st.sidebar:
     voice_choice = st.selectbox("Voice", ["alloy", "verse", "aria", "bright"], index=0, help="Pick a TTS voice")
     st.write("Storage: local SQLite (journal.db)")
     if st.button("Export CSV"):
-        df = load_entries()
+        df = load_entries(user_id)
         st.download_button(
             label="Download journal.csv",
             data=df.to_csv(index=False).encode("utf-8"),
@@ -238,7 +352,7 @@ if st.button("Get Companion Reply", type="primary"):
         with st.status("Thinking...", expanded=False):
             reply = call_openai(journal_text.strip(), mode)
         ts = datetime.utcnow().isoformat()
-        save_entry(ts, int(mood), tags.strip(), journal_text.strip(), mode, reply)
+        save_entry(user_id, ts, int(mood), tags.strip(), journal_text.strip(), mode, reply)
         st.success("Saved to your journal.")
         st.markdown("### Companion Reply")
         st.write(reply)
@@ -252,7 +366,7 @@ if st.button("Get Companion Reply", type="primary"):
 st.divider()
 st.subheader("📘 Recent Entries")
 
-df = load_entries()
+df = load_entries(user_id)
 if df.empty:
     st.caption("Your journal is empty. Your first entry will appear here.")
 else:
